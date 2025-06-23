@@ -34,6 +34,7 @@ use Compress::Zlib;
 use AI;
 use Globals;
 use Field;
+use InventoryList;
 #use Settings;
 use Log qw(message warning error debug);
 use FileParsers qw(updateMonsterLUT updateNPCLUT);
@@ -1075,7 +1076,7 @@ sub parse_account_server_info {
 			types => 'a4 v Z20 v5',
 			keys => [qw(ip port name state users property sid unknown)],
 		};
-	} elsif ($args->{switch} eq '0C32' && $masterServer->{serverType} eq "ROla") { # ROla
+	} elsif ($args->{switch} eq '0C32') {
 		$server_info = {
 			len => 165,
 			types => 'a4 v Z20 v3 a128 a5',
@@ -1142,6 +1143,12 @@ sub reconstruct_account_server_info {
 			len => 36,
 			types => 'a4 v Z20 v5',
 			keys => [qw(ip port name state users property sid unknown)],
+		};
+	} elsif ($args->{switch} eq '0C32') {
+		$serverInfo = {
+			len => 165,
+			types => 'a4 v Z20 v3 a128 a5',
+			keys => [qw(ip port name users state property ip_port unknown)],
 		};
 	} else {
 		$serverInfo = {
@@ -1262,9 +1269,9 @@ sub map_loaded {
 		$messageSender->sendSync(1);
 
 		# Request for Guild Information
-		$messageSender->sendGuildRequestInfo(0) if ($masterServer->{serverType} ne 'twRO'); # twRO does not send this packet
+		$messageSender->sendGuildRequestInfo(0) unless (grep { $masterServer->{serverType} eq $_ } qw(twRO ROla)); # some servers does not send this packet
 
-		$messageSender->sendRequestCashItemsList() if (grep { $masterServer->{serverType} eq $_ } qw(bRO idRO_Renewal twRO)); # tested at bRO 2013.11.30, request for cashitemslist
+		$messageSender->sendRequestCashItemsList() if (grep { $masterServer->{serverType} eq $_ } qw(bRO idRO_Renewal twRO ROla)); # tested at bRO 2013.11.30, request for cashitemslist
 		$messageSender->sendCashShopOpen() if ($config{whenInGame_requestCashPoints});
 
 		# request to unfreeze char - alisonrag
@@ -3933,7 +3940,13 @@ sub vender_items_list {
 
 	my $player = Actor::get($args->{venderID});
 
-	$venderItemList->clear;
+	eval {
+		$venderItemList->clear();
+	};
+	if ($@) {
+		warning "Error clearing venderItemList: $@\n";
+		$venderItemList = InventoryList->new;
+	}
 
 	my $msg = TF("%s\n" .
 		"#  Name                                      Type                           Price Amount\n",
@@ -3944,7 +3957,19 @@ sub vender_items_list {
  		@$item{qw( price amount ID type nameID identified broken upgrade cards options location sprite_id )} = unpack $item_pack, substr $args->{itemList}, $i, $item_len;
 
 		$item->{name} = itemName($item);
-		$venderItemList->add($item);
+		
+		# Check if item with same ID already exists before adding
+		if (defined $item->{ID}) {
+			my $existing_item = $venderItemList->getByID($item->{ID});
+			if (!$existing_item) {
+				$venderItemList->add($item);
+			} else {
+				debug("Skipping duplicate vender item with ID: " . unpack("V", $item->{ID}) . " (Name: $item->{name})\n", "vending", 2);
+				next; # Skip this item and continue to next iteration
+			}
+		} else {
+			$venderItemList->add($item);
+		}
 
 		debug("Item added to Vender Store: $item->{name} - $item->{price} z\n", "vending", 2);
 
@@ -4847,8 +4872,18 @@ sub quest_update_mission_hunt {
 
 		my $mission_id;
 
+		# Mission is saved as questID and server sent questID/hunt_id_cont
+		if (exists $quest->{missions} && exists $mission->{questID} && exists $mission->{hunt_id_cont}) {
+			foreach my $current_key (keys %{$quest->{missions}}) {
+				my $quest_mission = $quest->{missions}->{$current_key};
+				if (exists $quest_mission->{hunt_id_cont} && $quest_mission->{hunt_id_cont} == $mission->{hunt_id_cont}) {
+					$mission_id = $current_key;
+					last;
+				}
+			}
+		}
 		# Mission is saved as hunt_id and server sent hunt_id
-		if (exists $mission->{hunt_id} && exists $quest->{missions}->{$mission->{hunt_id}}) {
+		elsif (exists $mission->{hunt_id} && exists $quest->{missions}->{$mission->{hunt_id}}) {
 			$mission_id = $mission->{hunt_id};
 
 		# Mission is saved as mob_id and server sent mob_id
@@ -7998,12 +8033,56 @@ sub remain_time_info {
 }
 
 sub received_login_token {
-	my ($self, $args) = @_;
-	# XKore mode 1 / 3.
-	return if ($self->{net}->version == 1);
-	my $master = $masterServers{$config{master}};
-	# rathena use 0064 not 0825
-	$messageSender->sendTokenToServer($config{username}, $config{password}, $master->{master_version}, $master->{version}, $args->{login_token}, $args->{len}, $master->{OTP_ip}, $master->{OTP_port});
+    my ($self, $args) = @_;
+
+    # Skip in XKore mode 1 / 3
+    return if $self->{net}->version == 1;
+
+    my $master = $masterServers{$config{master}};
+    my $login_type = $args->{login_type};
+
+    if ($login_type == 0) {
+        # rAthena uses 0064 not 0825
+        $messageSender->sendTokenToServer(
+            $config{username},
+            $config{password},
+            $master->{master_version},
+            $master->{version},
+            $args->{login_token},
+            $args->{len},
+            $master->{ip},
+            $master->{port}
+        );
+    
+    } elsif ($login_type == 400 || $login_type == 1000) {
+        die 'ERROR: otpSeed is not set in config.txt' unless $config{otpSeed};
+
+        my $otp;
+        Plugins::callHook('request_otp_login', { otp => \$otp, seed => $config{otpSeed} });
+    	unless (defined $otp && length $otp) { 
+			error "No Plugin returned a OTP code for account $config{username}\n", 'connection';
+			$otp = $interface->query(T(', please enter your OTP: ')); 
+		}
+        $messageSender->sendOtpToServer($otp);
+
+	} elsif ($login_type == 300) {
+        error "OTP token malformed for account $config{username}\n", 'connection';
+        my $otp = $interface->query(T('Please enter the OTP code: '));
+        $messageSender->sendOtpToServer($otp);
+    
+    } elsif ($login_type == 500) {
+        error "Wrong OTP for account $config{username}\n", 'connection';
+        my $otp = $interface->query(T('Please enter the OTP code: '));
+        $messageSender->sendOtpToServer($otp);
+    
+    } elsif ($login_type == 600) {
+        error "Password Error for account $config{username}\n", 'connection';
+        Misc::quit();
+    
+    } else {
+        error "Unknown login_type $login_type\n", 'connection';
+		Misc::quit();
+    }
 }
 
 # this info will be sent to xkore 2 clients
